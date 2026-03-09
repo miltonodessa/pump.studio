@@ -1,0 +1,7 @@
+.env
+positions.json
+trades_log.csv
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
