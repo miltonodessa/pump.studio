@@ -332,16 +332,22 @@ def monitor_local_positions(store: PositionStore) -> None:
     now = time.time()
     to_close: list[tuple] = []
 
+    print(f"\n[LOCAL] Мониторинг {len(local_positions)} локальных позиций...")
     for pos in local_positions:
         mint = pos["mint"]
         datapoint = api.get_token_datapoint(mint)
         if datapoint is None:
+            print(f"  ⚠️  {mint[:12]}… | нет datapoint — пропускаем")
             continue
 
         current_price_usd = _get_token_price_usd(datapoint)
         entry_price_usd   = pos.get("entry_price_usd", 0.0)
 
-        if entry_price_usd <= 0 or current_price_usd <= 0:
+        if current_price_usd <= 0:
+            print(f"  ⚠️  {mint[:12]}… | цена = 0 (нет priceUsd/price/marketCap в datapoint) — пропускаем")
+            continue
+        if entry_price_usd <= 0:
+            print(f"  ⚠️  {mint[:12]}… | entry_price = 0 — пропускаем")
             continue
 
         # Обновляем trailing high
@@ -351,10 +357,18 @@ def monitor_local_positions(store: PositionStore) -> None:
             store.add(pos)  # сохраняем обновлённый trailing high
             trailing_high = current_price_usd
 
-        pnl_pct       = (current_price_usd - entry_price_usd) / entry_price_usd * 100.0
-        hold_s        = now - pos.get("opened_at", now)
-        trail_drop    = (trailing_high - current_price_usd) / trailing_high * 100.0 \
-                        if trailing_high > 0 else 0.0
+        pnl_pct    = (current_price_usd - entry_price_usd) / entry_price_usd * 100.0
+        hold_s     = now - pos.get("opened_at", now)
+        trail_drop = (trailing_high - current_price_usd) / trailing_high * 100.0 \
+                     if trailing_high > 0 else 0.0
+
+        pnl_emoji = "📈" if pnl_pct >= 0 else "📉"
+        print(
+            f"  {pnl_emoji} {mint[:12]}… | "
+            f"сейчас=${current_price_usd:.8f} | entry=${entry_price_usd:.8f} | "
+            f"PnL={pnl_pct:+.1f}% | trailing_drop={trail_drop:.1f}% | "
+            f"держим {int(hold_s)}s / {TIMEOUT_MINUTES * 60}s"
+        )
 
         reason = None
         if pnl_pct >= TAKE_PROFIT_PCT:
