@@ -284,10 +284,13 @@ def sync_portfolio(store: PositionStore) -> None:
     Записываем в лог и удаляем из хранилища.
     Если API вернул ошибку (None) — пропускаем синхронизацию, не трогаем позиции.
     """
+    # Если все позиции локальные — API не нужен
+    if all(p.get("local") for p in store.all()):
+        return
+
     api_positions = api.get_portfolio()
     if api_positions is None:
-        print("  [WARN] Portfolio API недоступен — синхронизация пропущена")
-        return
+        return  # 404 или сеть — пропускаем тихо
     api_ids   = {p.get("positionId", p.get("id", "")) for p in api_positions}
     api_mints = {p.get("mint", "") for p in api_positions}
 

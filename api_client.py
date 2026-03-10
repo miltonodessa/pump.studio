@@ -31,6 +31,8 @@ def _get(endpoint: str, params: dict = None, retries: int = 2) -> dict | None:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
+            if resp.status_code == 404:
+                return None  # тихо, 404 ожидаем на некоторых эндпоинтах
             print(f"[API][ERROR] GET {endpoint} → HTTP {resp.status_code}: {e}")
             return None
         except requests.exceptions.Timeout:
