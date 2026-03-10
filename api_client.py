@@ -77,14 +77,23 @@ def get_overview() -> list[dict]:
     """
     GET /api/v1/overview
     Возвращает список токенов (trending/new).
+    API может вернуть: список строк (mint-адреса), список dict, или {"tokens": [...]}.
     """
     data = _get("/api/v1/overview")
     if data is None:
         return []
-    # API может вернуть список напрямую или {"tokens": [...]}
     if isinstance(data, list):
-        return data
-    return data.get("tokens", data.get("data", []))
+        items = data
+    else:
+        items = data.get("tokens", data.get("data", []))
+    # Нормализуем: строки → {"mint": str}
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append({"mint": item})
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
 
 
 def get_token_datapoint(mint: str) -> dict | None:
@@ -132,14 +141,16 @@ def close_paper_trade(position_id: str) -> dict | None:
     return _post("/api/v1/paper/close", payload)
 
 
-def get_portfolio() -> list[dict]:
+def get_portfolio() -> list[dict] | None:
     """
     GET /api/v1/paper/portfolio?ownerId=API_KEY
-    Возвращает текущие открытые позиции.
+    Возвращает текущие открытые позиции, или None при ошибке API.
+    Отличаем None (ошибка) от [] (реально пустой портфель),
+    чтобы не закрыть все локальные позиции при недоступном эндпоинте.
     """
     data = _get("/api/v1/paper/portfolio", params={"ownerId": API_KEY})
     if data is None:
-        return []
+        return None  # ошибка API (404, сеть и т.д.)
     if isinstance(data, list):
         return data
     return data.get("positions", data.get("data", []))

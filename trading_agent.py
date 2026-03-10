@@ -39,7 +39,7 @@ POSITIONS_FILE   = Path("positions.json")
 # CSV лог
 # ---------------------------------------------------------------------------
 CSV_HEADERS = [
-    "timestamp", "mint", "score", "score_details",
+    "timestamp", "mint", "gmgn_url", "score", "score_details",
     "sol_amount", "entry_price", "exit_price",
     "pnl_pct", "exit_reason", "hold_seconds",
 ]
@@ -139,9 +139,14 @@ def print_header(cycle: int) -> None:
     print(f"{'='*60}")
 
 
+GMGN_URL = "https://gmgn.ai/sol/token/{mint}"
+
+
 def print_buy(mint: str, score: int, sol_amount: float, details: dict) -> None:
+    gmgn = GMGN_URL.format(mint=mint)
     print(f"\n  ✅ ПОКУПКА | {mint}")
     print(f"     Score: {score}/5 | Размер: {sol_amount} SOL")
+    print(f"     gmgn: {gmgn}")
     print(format_score_details(score, details, mint))
 
 
@@ -175,8 +180,12 @@ def sync_portfolio(store: PositionStore) -> None:
     Запрашивает текущий портфель через API.
     Если позиция пропала из API — значит она закрылась (TP/SL/timeout).
     Записываем в лог и удаляем из хранилища.
+    Если API вернул ошибку (None) — пропускаем синхронизацию, не трогаем позиции.
     """
     api_positions = api.get_portfolio()
+    if api_positions is None:
+        print("  [WARN] Portfolio API недоступен — синхронизация пропущена")
+        return
     api_ids = {p.get("positionId", p.get("id", "")) for p in api_positions}
     api_mints = {p.get("mint", "") for p in api_positions}
 
@@ -205,6 +214,7 @@ def sync_portfolio(store: PositionStore) -> None:
             log_trade({
                 "timestamp":    now_str(),
                 "mint":         mint,
+                "gmgn_url":     GMGN_URL.format(mint=mint),
                 "score":        pos["score"],
                 "score_details": json.dumps(pos.get("score_details", {}), ensure_ascii=False),
                 "sol_amount":   pos["sol_amount"],
@@ -307,6 +317,7 @@ def main() -> None:
                 log_trade({
                     "timestamp":    now_str(),
                     "mint":         mint,
+                    "gmgn_url":     GMGN_URL.format(mint=mint),
                     "score":        score,
                     "score_details": json.dumps(details, ensure_ascii=False),
                     "sol_amount":   sol_amount,
