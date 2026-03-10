@@ -31,6 +31,7 @@ TAKE_PROFIT_PCT    = 25.0
 TRAILING_STOP_PCT  = 8.0
 STOP_LOSS_PCT      = 12.0
 TIMEOUT_MINUTES    = 20
+TRADE_FEE_PCT      = 1.0      # % комиссии на каждую сделку (buy и sell)
 
 TRADES_LOG_FILE  = Path("trades_log.csv")
 POSITIONS_FILE   = Path("positions.json")
@@ -40,7 +41,9 @@ POSITIONS_FILE   = Path("positions.json")
 # ---------------------------------------------------------------------------
 CSV_HEADERS = [
     "timestamp", "mint", "gmgn_url", "score", "score_details",
-    "sol_amount", "entry_price", "exit_price",
+    "sol_amount",
+    "entry_price_usd", "exit_price_usd",
+    "buy_usd", "sell_usd", "fee_usd", "pnl_usd",
     "pnl_pct", "exit_reason", "hold_seconds",
 ]
 
@@ -63,6 +66,56 @@ def log_trade(record: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
+
+def _to_float(val, default: float = 0.0) -> float:
+    """Безопасно конвертирует любое значение в float."""
+    if val is None or isinstance(val, (dict, list, bool)):
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_sol_price(datapoint: dict) -> float:
+    """Цена SOL в USD из datapoint, fallback 85."""
+    return _to_float(datapoint.get("solPriceUsd"), 85.0)
+
+
+def _get_token_price_usd(datapoint: dict) -> float:
+    """
+    Цена одного токена в USD.
+    Приоритет: priceUsd → price → marketCap / totalSupply (1B для pump.fun).
+    """
+    price = _to_float(datapoint.get("priceUsd") or datapoint.get("price"))
+    if price > 0:
+        return price
+    mc_usd = _to_float(datapoint.get("marketCap"))
+    supply = _to_float(datapoint.get("totalSupply"), 1_000_000_000.0)
+    if mc_usd > 0 and supply > 0:
+        return mc_usd / supply
+    return 0.0
+
+
+def _calc_usd(sol_amount: float, sol_price: float, pnl_pct: float = 0.0) -> dict:
+    """Рассчитывает USD-значения сделки с учётом комиссий."""
+    buy_usd  = sol_amount * sol_price
+    sell_usd = buy_usd * (1.0 + pnl_pct / 100.0)
+    buy_fee  = buy_usd  * (TRADE_FEE_PCT / 100.0)
+    sell_fee = sell_usd * (TRADE_FEE_PCT / 100.0)
+    total_fee = buy_fee + sell_fee
+    pnl_usd  = (sell_usd - sell_fee) - (buy_usd + buy_fee)
+    return {
+        "buy_usd":  round(buy_usd,   2),
+        "sell_usd": round(sell_usd,  2),
+        "fee_usd":  round(total_fee, 2),
+        "pnl_usd":  round(pnl_usd,  2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Хранилище позиций (in-memory + JSON)
 # ---------------------------------------------------------------------------
 
@@ -72,12 +125,15 @@ class PositionStore:
 
     Структура позиции:
     {
-        "mint": str,
-        "position_id": str,        # id из API ответа
-        "score": int,
-        "sol_amount": float,
-        "entry_price": float,
-        "opened_at": float,        # unix timestamp
+        "mint":             str,
+        "position_id":      str,          # id из API ответа (пусто для локальных)
+        "local":            bool,         # True = API недоступен, трекаем сами
+        "score":            int,
+        "sol_amount":       float,
+        "sol_price_usd":    float,        # цена SOL в USD на момент покупки
+        "entry_price_usd":  float,        # цена токена в USD на момент покупки
+        "trailing_high_usd": float,       # максимальная цена для trailing stop
+        "opened_at":        float,        # unix timestamp
     }
     """
 
@@ -142,10 +198,15 @@ def print_header(cycle: int) -> None:
 GMGN_URL = "https://gmgn.ai/sol/token/{mint}"
 
 
-def print_buy(mint: str, score: int, sol_amount: float, details: dict) -> None:
+def print_buy(mint: str, score: int, sol_amount: float,
+              sol_price: float, entry_price_usd: float, details: dict) -> None:
     gmgn = GMGN_URL.format(mint=mint)
+    buy_usd = sol_amount * sol_price
+    buy_fee = buy_usd * (TRADE_FEE_PCT / 100.0)
     print(f"\n  ✅ ПОКУПКА | {mint}")
     print(f"     Score: {score}/5 | Размер: {sol_amount} SOL")
+    print(f"     Цена SOL: ${sol_price:.2f} | Цена токена: ${entry_price_usd:.8f}")
+    print(f"     Стоимость: ${buy_usd:.2f} + ${buy_fee:.2f} комиссия = ${buy_usd + buy_fee:.2f} итого")
     print(f"     gmgn: {gmgn}")
     print(format_score_details(score, details, mint))
 
@@ -163,12 +224,52 @@ def print_position_status(positions: list[dict]) -> None:
     print(f"  📊 Открытых позиций: {len(positions)}")
     for p in positions:
         age = int(time.time() - p.get("opened_at", time.time()))
+        mode = "LOCAL" if p.get("local") else "API"
         print(
             f"     • {p['mint'][:12]}… | "
             f"Score {p['score']} | "
             f"{p['sol_amount']} SOL | "
-            f"Возраст: {age}s"
+            f"entry=${p.get('entry_price_usd', 0):.8f} | "
+            f"Возраст: {age}s [{mode}]"
         )
+
+
+def _print_close(pos: dict, exit_price_usd: float, pnl_pct: float,
+                 reason: str, hold_s: int) -> None:
+    sol_amount = pos["sol_amount"]
+    sol_price  = pos.get("sol_price_usd", 85.0)
+    usd = _calc_usd(sol_amount, sol_price, pnl_pct)
+    emoji = "🟢" if pnl_pct >= 0 else "🔴"
+    print(
+        f"  {emoji} ЗАКРЫТА [{reason}] | {pos['mint'][:12]}… | "
+        f"PnL={pnl_pct:+.1f}% (${usd['pnl_usd']:+.2f}) | "
+        f"Купил ${usd['buy_usd']:.2f} → Продал ${usd['sell_usd']:.2f} | "
+        f"Комиссия ${usd['fee_usd']:.2f} | держали {hold_s}s"
+    )
+
+
+def _log_close(pos: dict, exit_price_usd: float, pnl_pct: float,
+               reason: str, hold_s: int) -> None:
+    sol_amount = pos["sol_amount"]
+    sol_price  = pos.get("sol_price_usd", 85.0)
+    usd = _calc_usd(sol_amount, sol_price, pnl_pct)
+    log_trade({
+        "timestamp":       now_str(),
+        "mint":            pos["mint"],
+        "gmgn_url":        GMGN_URL.format(mint=pos["mint"]),
+        "score":           pos["score"],
+        "score_details":   json.dumps(pos.get("score_details", {}), ensure_ascii=False),
+        "sol_amount":      sol_amount,
+        "entry_price_usd": round(pos.get("entry_price_usd", 0), 8),
+        "exit_price_usd":  round(exit_price_usd, 8),
+        "buy_usd":         usd["buy_usd"],
+        "sell_usd":        usd["sell_usd"],
+        "fee_usd":         usd["fee_usd"],
+        "pnl_usd":         usd["pnl_usd"],
+        "pnl_pct":         round(pnl_pct, 2),
+        "exit_reason":     reason,
+        "hold_seconds":    hold_s,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +287,15 @@ def sync_portfolio(store: PositionStore) -> None:
     if api_positions is None:
         print("  [WARN] Portfolio API недоступен — синхронизация пропущена")
         return
-    api_ids = {p.get("positionId", p.get("id", "")) for p in api_positions}
+    api_ids   = {p.get("positionId", p.get("id", "")) for p in api_positions}
     api_mints = {p.get("mint", "") for p in api_positions}
 
     closed_mints = []
     for pos in store.all():
-        mint = pos["mint"]
+        if pos.get("local"):
+            continue  # локальные позиции не синхронизируем через API
+        mint   = pos["mint"]
         pos_id = pos.get("position_id", "")
-        # Считаем закрытой, если не нашли ни по positionId, ни по mint
         is_open = (pos_id and pos_id in api_ids) or (mint in api_mints)
         if not is_open:
             closed_mints.append(mint)
@@ -201,34 +303,77 @@ def sync_portfolio(store: PositionStore) -> None:
     for mint in closed_mints:
         pos = store.remove(mint)
         if pos:
-            hold = int(time.time() - pos.get("opened_at", time.time()))
-            # Ищем финальные данные в api_positions (если API их вернул)
+            hold_s = int(time.time() - pos.get("opened_at", time.time()))
             api_pos = next(
-                (p for p in api_positions if p.get("mint") == mint),
-                {}
+                (p for p in api_positions if p.get("mint") == mint), {}
             )
-            exit_price = api_pos.get("exitPrice", api_pos.get("exit_price", ""))
-            pnl_pct    = api_pos.get("pnlPct",   api_pos.get("pnl_pct", ""))
-            exit_reason = api_pos.get("exitReason", api_pos.get("exit_reason", "closed_by_server"))
+            exit_price_raw = api_pos.get("exitPrice", api_pos.get("exit_price", 0))
+            pnl_pct        = _to_float(api_pos.get("pnlPct", api_pos.get("pnl_pct", 0)))
+            reason         = api_pos.get("exitReason", api_pos.get("exit_reason", "closed_by_server"))
+            exit_price_usd = _to_float(exit_price_raw)
 
-            log_trade({
-                "timestamp":    now_str(),
-                "mint":         mint,
-                "gmgn_url":     GMGN_URL.format(mint=mint),
-                "score":        pos["score"],
-                "score_details": json.dumps(pos.get("score_details", {}), ensure_ascii=False),
-                "sol_amount":   pos["sol_amount"],
-                "entry_price":  pos.get("entry_price", ""),
-                "exit_price":   exit_price,
-                "pnl_pct":      pnl_pct,
-                "exit_reason":  exit_reason,
-                "hold_seconds": hold,
-            })
-            print(
-                f"  🏁 ЗАКРЫТА | {mint[:12]}… | "
-                f"PnL={pnl_pct}% | причина={exit_reason} | "
-                f"держали {hold}s"
-            )
+            _log_close(pos, exit_price_usd, pnl_pct, reason, hold_s)
+            _print_close(pos, exit_price_usd, pnl_pct, reason, hold_s)
+
+
+# ---------------------------------------------------------------------------
+# Мониторинг локальных позиций (TP / SL / trailing / timeout)
+# ---------------------------------------------------------------------------
+
+def monitor_local_positions(store: PositionStore) -> None:
+    """
+    Для позиций с local=True запрашивает текущую цену токена и проверяет
+    условия закрытия: TP, SL, trailing stop, timeout.
+    """
+    local_positions = [p for p in store.all() if p.get("local")]
+    if not local_positions:
+        return
+
+    now = time.time()
+    to_close: list[tuple] = []
+
+    for pos in local_positions:
+        mint = pos["mint"]
+        datapoint = api.get_token_datapoint(mint)
+        if datapoint is None:
+            continue
+
+        current_price_usd = _get_token_price_usd(datapoint)
+        entry_price_usd   = pos.get("entry_price_usd", 0.0)
+
+        if entry_price_usd <= 0 or current_price_usd <= 0:
+            continue
+
+        # Обновляем trailing high
+        trailing_high = pos.get("trailing_high_usd", entry_price_usd)
+        if current_price_usd > trailing_high:
+            pos["trailing_high_usd"] = current_price_usd
+            store.add(pos)  # сохраняем обновлённый trailing high
+            trailing_high = current_price_usd
+
+        pnl_pct       = (current_price_usd - entry_price_usd) / entry_price_usd * 100.0
+        hold_s        = now - pos.get("opened_at", now)
+        trail_drop    = (trailing_high - current_price_usd) / trailing_high * 100.0 \
+                        if trailing_high > 0 else 0.0
+
+        reason = None
+        if pnl_pct >= TAKE_PROFIT_PCT:
+            reason = "take_profit"
+        elif pnl_pct <= -STOP_LOSS_PCT:
+            reason = "stop_loss"
+        elif trail_drop >= TRAILING_STOP_PCT and pnl_pct > 0:
+            reason = "trailing_stop"
+        elif hold_s >= TIMEOUT_MINUTES * 60:
+            reason = "timeout"
+
+        if reason:
+            to_close.append((pos, current_price_usd, pnl_pct, reason))
+
+    for pos, exit_price_usd, pnl_pct, reason in to_close:
+        hold_s = int(now - pos.get("opened_at", now))
+        store.remove(pos["mint"])
+        _log_close(pos, exit_price_usd, pnl_pct, reason, hold_s)
+        _print_close(pos, exit_price_usd, pnl_pct, reason, hold_s)
 
 
 # ---------------------------------------------------------------------------
@@ -244,21 +389,26 @@ def main() -> None:
     print(f"  Интервал: {POLL_INTERVAL}s | Макс позиций: {MAX_OPEN_POSITIONS}")
     print(f"  Мин score: {MIN_SCORE} | TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%")
     print(f"  Трейлинг: {TRAILING_STOP_PCT}% | Timeout: {TIMEOUT_MINUTES}m")
+    print(f"  Комиссия: {TRADE_FEE_PCT}% на сделку (buy + sell)")
     print("=" * 60)
 
     cycle = 0
-    seen_mints: set[str] = store.all_mints().copy()  # токены которые мы уже видели/купили
+    seen_mints: set[str] = store.all_mints().copy()
 
     while True:
         cycle += 1
         print_header(cycle)
 
-        # 1. Синхронизируем портфель (закрытые позиции → лог)
+        # 1. Синхронизируем API-позиции (закрытые сервером → лог)
         print("\n[SYNC] Синхронизация портфеля...")
         sync_portfolio(store)
+
+        # 2. Мониторим локальные позиции (TP/SL/trailing/timeout)
+        monitor_local_positions(store)
+
         print_position_status(store.all())
 
-        # 2. Получаем список новых токенов
+        # 3. Получаем список новых токенов
         print("\n[SCAN] Получаем список токенов...")
         tokens = api.get_overview()
         if not tokens:
@@ -266,21 +416,19 @@ def main() -> None:
         else:
             print(f"[SCAN] Получено {len(tokens)} токенов")
 
-        # 3. Фильтруем и оцениваем токены
+        # 4. Фильтруем и оцениваем токены
         new_tokens_found = 0
         for token in tokens:
             mint = token.get("mint", token.get("address", ""))
             if not mint:
                 continue
 
-            # Пропускаем уже виденные (куплены или оценены в этом/предыдущем цикле)
             if mint in seen_mints:
                 continue
 
             seen_mints.add(mint)
             new_tokens_found += 1
 
-            # Проверка лимита позиций
             if store.count() >= MAX_OPEN_POSITIONS:
                 print_skip(mint, 0, f"достигнут лимит позиций ({MAX_OPEN_POSITIONS})")
                 continue
@@ -288,9 +436,8 @@ def main() -> None:
             # Получаем детальные данные токена
             datapoint = api.get_token_datapoint(mint)
             if datapoint is None:
-                # Fallback: используем данные из overview
                 datapoint = token
-                print(f"  [WARN] Не удалось получить datapoint для {mint[:12]}… — используем overview данные")
+                print(f"  [WARN] Нет datapoint для {mint[:12]}… — используем overview данные")
 
             # Считаем score
             score, details = calculate_score(datapoint)
@@ -299,9 +446,12 @@ def main() -> None:
                 print_skip(mint, score, f"score {score} < {MIN_SCORE}")
                 continue
 
-            # Score достаточный — открываем позицию
-            sol_amount = get_sol_amount(score)
-            print_buy(mint, score, sol_amount, details)
+            # Цены для логирования
+            sol_price       = _get_sol_price(datapoint)
+            entry_price_usd = _get_token_price_usd(datapoint)
+            sol_amount      = get_sol_amount(score)
+
+            print_buy(mint, score, sol_amount, sol_price, entry_price_usd, details)
 
             result = api.open_paper_trade(
                 mint=mint,
@@ -313,42 +463,70 @@ def main() -> None:
             )
 
             if result is None:
-                print(f"  [ERROR] Не удалось открыть позицию для {mint} — пропускаем")
-                log_trade({
-                    "timestamp":    now_str(),
-                    "mint":         mint,
-                    "gmgn_url":     GMGN_URL.format(mint=mint),
-                    "score":        score,
-                    "score_details": json.dumps(details, ensure_ascii=False),
-                    "sol_amount":   sol_amount,
-                    "entry_price":  "",
-                    "exit_price":   "",
-                    "pnl_pct":      "",
-                    "exit_reason":  "api_error_on_open",
-                    "hold_seconds": 0,
-                })
+                # API недоступен — открываем позицию локально
+                if entry_price_usd > 0:
+                    position = {
+                        "mint":              mint,
+                        "position_id":       "",
+                        "local":             True,
+                        "score":             score,
+                        "score_details":     details,
+                        "sol_amount":        sol_amount,
+                        "sol_price_usd":     sol_price,
+                        "entry_price_usd":   entry_price_usd,
+                        "trailing_high_usd": entry_price_usd,
+                        "opened_at":         time.time(),
+                    }
+                    store.add(position)
+                    usd = _calc_usd(sol_amount, sol_price)
+                    print(
+                        f"  📌 [LOCAL] Позиция открыта локально | "
+                        f"entry=${entry_price_usd:.8f} | "
+                        f"Куплено за ${usd['buy_usd']:.2f} + ${usd['fee_usd']:.2f} fee"
+                    )
+                else:
+                    print(f"  [ERROR] Не удалось открыть позицию для {mint} — нет цены, пропускаем")
+                    log_trade({
+                        "timestamp":   now_str(),
+                        "mint":        mint,
+                        "gmgn_url":    GMGN_URL.format(mint=mint),
+                        "score":       score,
+                        "score_details": json.dumps(details, ensure_ascii=False),
+                        "sol_amount":  sol_amount,
+                        "exit_reason": "api_error_no_price",
+                        "hold_seconds": 0,
+                    })
                 continue
 
-            # Сохраняем позицию
+            # API успешно открыл позицию
+            api_entry = _to_float(result.get("entryPrice", result.get("entry_price", 0)))
+            if api_entry <= 0:
+                api_entry = entry_price_usd  # fallback на локальную цену
+
             position = {
-                "mint":         mint,
-                "position_id":  result.get("positionId", result.get("id", "")),
-                "score":        score,
-                "score_details": details,
-                "sol_amount":   sol_amount,
-                "entry_price":  result.get("entryPrice", result.get("entry_price", "")),
-                "opened_at":    time.time(),
+                "mint":              mint,
+                "position_id":       result.get("positionId", result.get("id", "")),
+                "local":             False,
+                "score":             score,
+                "score_details":     details,
+                "sol_amount":        sol_amount,
+                "sol_price_usd":     sol_price,
+                "entry_price_usd":   api_entry,
+                "trailing_high_usd": api_entry,
+                "opened_at":         time.time(),
             }
             store.add(position)
+            usd = _calc_usd(sol_amount, sol_price)
             print(
                 f"  📌 Позиция открыта | id={position['position_id']} | "
-                f"entry={position['entry_price']}"
+                f"entry=${api_entry:.8f} | "
+                f"Куплено за ${usd['buy_usd']:.2f} + ${usd['fee_usd']:.2f} fee"
             )
 
         if new_tokens_found == 0 and tokens:
             print("  ℹ  Новых токенов в этом цикле нет")
 
-        # 4. Пауза до следующего цикла
+        # 5. Пауза до следующего цикла
         print(f"\n[SLEEP] Следующий цикл через {POLL_INTERVAL}s... (Ctrl+C для выхода)")
         try:
             time.sleep(POLL_INTERVAL)
