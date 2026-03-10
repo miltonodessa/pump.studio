@@ -32,6 +32,7 @@ TRAILING_STOP_PCT  = 8.0
 STOP_LOSS_PCT      = 12.0
 TIMEOUT_MINUTES    = 20
 TRADE_FEE_PCT      = 1.0      # % комиссии на каждую сделку (buy и sell)
+MAX_MARKET_CAP_USD = 5000.0   # максимальная капа токена в USD для покупки
 
 TRADES_LOG_FILE  = Path("trades_log.csv")
 POSITIONS_FILE   = Path("positions.json")
@@ -452,6 +453,12 @@ def main() -> None:
             if datapoint is None:
                 datapoint = token
                 print(f"  [WARN] Нет datapoint для {mint[:12]}… — используем overview данные")
+
+            # Фильтр по капе в USD (до score, чтобы не тратить время)
+            mc_usd = _to_float(datapoint.get("marketCap"))
+            if mc_usd > MAX_MARKET_CAP_USD:
+                print_skip(mint, 0, f"капа ${mc_usd:,.0f} > ${MAX_MARKET_CAP_USD:,.0f}")
+                continue
 
             # Считаем score
             score, details = calculate_score(datapoint)
