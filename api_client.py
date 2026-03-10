@@ -73,26 +73,60 @@ def _post(endpoint: str, payload: dict, retries: int = 2) -> dict | None:
 # Публичные функции
 # ---------------------------------------------------------------------------
 
+def _is_valid_mint(s: str) -> bool:
+    """
+    Solana mint-адрес — base58, 32–44 символа.
+    Отфильтровываем служебные ключи типа 'newCoins', 'trending' и т.д.
+    """
+    BASE58_CHARS = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+    return 32 <= len(s) <= 44 and all(c in BASE58_CHARS for c in s)
+
+
 def get_overview() -> list[dict]:
     """
     GET /api/v1/overview
     Возвращает список токенов (trending/new).
-    API может вернуть: список строк (mint-адреса), список dict, или {"tokens": [...]}.
+
+    API может вернуть несколько форматов:
+      • dict  → ключи — это секции ("newCoins", "trending", ...), значения — списки токенов
+      • list  → элементы — строки-mint-адреса или dict-токены
     """
     data = _get("/api/v1/overview")
     if data is None:
         return []
-    if isinstance(data, list):
-        items = data
+
+    # Собираем сырые элементы
+    raw_items: list = []
+    if isinstance(data, dict):
+        # Порядок секций: сначала самые свежие токены
+        SECTION_ORDER = ("newCoins", "liveSpotlight", "trending", "gainers1h", "volLeaders", "losers1h")
+        seen_sections = set(SECTION_ORDER) & set(data.keys())
+        other_sections = set(data.keys()) - seen_sections
+        for key in list(SECTION_ORDER) + sorted(other_sections):
+            section = data.get(key)
+            if isinstance(section, list):
+                raw_items.extend(section)
+            elif isinstance(section, dict):
+                # Значение само является токеном
+                raw_items.append(section)
+    elif isinstance(data, list):
+        raw_items = data
     else:
-        items = data.get("tokens", data.get("data", []))
-    # Нормализуем: строки → {"mint": str}
-    result = []
-    for item in items:
+        return []
+
+    # Нормализуем и дедуплицируем
+    result: list[dict] = []
+    seen_mints: set[str] = set()
+    for item in raw_items:
         if isinstance(item, str):
-            result.append({"mint": item})
+            if _is_valid_mint(item) and item not in seen_mints:
+                seen_mints.add(item)
+                result.append({"mint": item})
         elif isinstance(item, dict):
-            result.append(item)
+            mint = item.get("mint", item.get("address", ""))
+            if mint and mint not in seen_mints:
+                seen_mints.add(mint)
+                result.append(item)
     return result
 
 
