@@ -13,6 +13,16 @@ score_engine.py — функция calculate_score(token_data) → (int, dict)
 import time
 
 
+def _to_float(val, default: float = 0.0) -> float:
+    """Безопасно конвертирует любое значение в float. Dict/list → default."""
+    if val is None or isinstance(val, (dict, list, bool)):
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Вспомогательные вычисления по recentTrades
 # ---------------------------------------------------------------------------
@@ -74,10 +84,7 @@ def calculate_score(token_data: dict) -> tuple[int, dict]:
         created_ms = token_data.get("createdAt", token_data.get("created_timestamp", 0))
         age_s = (now_ms - created_ms) / 1000 if created_ms else -1
 
-    try:
-        age_s = float(age_s)
-    except (TypeError, ValueError):
-        age_s = -1.0
+    age_s = _to_float(age_s, -1.0)
 
     c1 = 90 <= age_s <= 300
     details["age"] = {
@@ -93,14 +100,14 @@ def calculate_score(token_data: dict) -> tuple[int, dict]:
     # Datapoint: marketCap (USD) / solPriceUsd → SOL
     # Overview fallback: market_cap (уже в SOL)
     # ------------------------------------------------------------------
-    mc_usd = token_data.get("marketCap")          # datapoint → USD
-    mc_sol_direct = token_data.get("market_cap")  # overview  → SOL
+    mc_usd        = _to_float(token_data.get("marketCap"))          # datapoint → USD
+    mc_sol_direct = _to_float(token_data.get("market_cap"))         # overview  → SOL
+    sol_price     = _to_float(token_data.get("solPriceUsd"), 85.0)  # fallback 85 USD
 
-    if mc_usd is not None:
-        sol_price = token_data.get("solPriceUsd", 0)
-        mc_sol = float(mc_usd) / float(sol_price) if sol_price else 0.0
-    elif mc_sol_direct is not None:
-        mc_sol = float(mc_sol_direct)
+    if mc_usd > 0:
+        mc_sol = mc_usd / sol_price if sol_price else 0.0
+    elif mc_sol_direct > 0:
+        mc_sol = mc_sol_direct
     else:
         mc_sol = 0.0
 
