@@ -82,60 +82,62 @@ def _is_valid_mint(s: str) -> bool:
     return 32 <= len(s) <= 44 and all(c in BASE58_CHARS for c in s)
 
 
+def _unwrap(data) -> any:
+    """Разворачивает {"ok": true, "data": ...} → data."""
+    if isinstance(data, dict) and "ok" in data and "data" in data:
+        return data["data"]
+    return data
+
+
 def get_overview() -> list[dict]:
     """
-    GET /api/v1/overview
-    Возвращает список токенов (trending/new).
-
-    API может вернуть несколько форматов:
-      • dict  → ключи — это секции ("newCoins", "trending", ...), значения — списки токенов
-      • list  → элементы — строки-mint-адреса или dict-токены
+    GET /api/v1/overview → {"ok": true, "data": {"newCoins": [...], "trending": [...], ...}}
+    Итерирует секции в порядке приоритета и возвращает дедуплицированный список токенов.
     """
-    data = _get("/api/v1/overview")
-    if data is None:
+    raw = _get("/api/v1/overview")
+    if raw is None:
         return []
+    data = _unwrap(raw)
 
-    # Собираем сырые элементы
     raw_items: list = []
     if isinstance(data, dict):
-        # Порядок секций: сначала самые свежие токены
         SECTION_ORDER = ("newCoins", "liveSpotlight", "trending", "gainers1h", "volLeaders", "losers1h")
-        seen_sections = set(SECTION_ORDER) & set(data.keys())
-        other_sections = set(data.keys()) - seen_sections
-        for key in list(SECTION_ORDER) + sorted(other_sections):
+        other = sorted(set(data.keys()) - set(SECTION_ORDER))
+        for key in list(SECTION_ORDER) + other:
             section = data.get(key)
             if isinstance(section, list):
                 raw_items.extend(section)
             elif isinstance(section, dict):
-                # Значение само является токеном
                 raw_items.append(section)
     elif isinstance(data, list):
         raw_items = data
     else:
         return []
 
-    # Нормализуем и дедуплицируем
     result: list[dict] = []
-    seen_mints: set[str] = set()
+    seen: set[str] = set()
     for item in raw_items:
         if isinstance(item, str):
-            if _is_valid_mint(item) and item not in seen_mints:
-                seen_mints.add(item)
+            if _is_valid_mint(item) and item not in seen:
+                seen.add(item)
                 result.append({"mint": item})
         elif isinstance(item, dict):
             mint = item.get("mint", item.get("address", ""))
-            if mint and mint not in seen_mints:
-                seen_mints.add(mint)
+            if mint and mint not in seen:
+                seen.add(mint)
                 result.append(item)
     return result
 
 
 def get_token_datapoint(mint: str) -> dict | None:
     """
-    GET /api/v1/datapoint?mint=MINT
-    Возвращает 71-field данные токена.
+    GET /api/v1/datapoint?mint=MINT → {"ok": true, "data": {...71 fields...}}
+    Возвращает распакованные данные токена.
     """
-    return _get("/api/v1/datapoint", params={"mint": mint})
+    raw = _get("/api/v1/datapoint", params={"mint": mint})
+    if raw is None:
+        return None
+    return _unwrap(raw)
 
 
 def open_paper_trade(
